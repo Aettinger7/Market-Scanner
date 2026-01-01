@@ -1,0 +1,227 @@
+import pandas as pd
+import numpy as np
+from datetime import datetime, timedelta
+from time import sleep
+from polygon import RESTClient
+
+# Indicators (all the smart math stuff)
+def rsi(series, period=14):
+    delta = series.diff()
+    gain = delta.where(delta > 0, 0).rolling(window=period).mean()
+    loss = -delta.where(delta < 0, 0).rolling(window=period).mean()
+    rs = gain / loss
+    return 100 - (100 / (1 + rs))
+
+def macd(series, fast=12, slow=26, signal=9):
+    ema_fast = series.ewm(span=fast, adjust=False).mean()
+    ema_slow = series.ewm(span=slow, adjust=False).mean()
+    macd_line = ema_fast - ema_slow
+    signal_line = macd_line.ewm(span=signal, adjust=False).mean()
+    histogram = macd_line - signal_line
+    return macd_line, signal_line, histogram
+
+def ema(series, period):
+    return series.ewm(span=period, adjust=False).mean()
+
+def atr(high, low, close, period=14):
+    tr1 = high - low
+    tr2 = abs(high - close.shift())
+    tr3 = abs(low - close.shift())
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    return tr.rolling(window=period).mean()
+
+def adx(high, low, close, period=14):
+    plus_dm = high.diff()
+    minus_dm = -low.diff()
+    plus_dm = plus_dm.where((plus_dm > minus_dm) & (plus_dm > 0), 0)
+    minus_dm = minus_dm.where((minus_dm > plus_dm) & (minus_dm > 0), 0)
+    tr = atr(high, low, close, period=1)
+    plus_di = 100 * (plus_dm.ewm(span=period, adjust=False).mean() / tr.ewm(span=period, adjust=False).mean())
+    minus_di = 100 * (minus_dm.ewm(span=period, adjust=False).mean() / tr.ewm(span=period, adjust=False).mean())
+    dx = (abs(plus_di - minus_di) / (plus_di + minus_di)) * 100
+    return dx.rolling(window=period).mean()
+
+def is_bullish_divergence(price, indicator, lookback=30):
+    recent_price = price[-lookback:]
+    lows = (recent_price.shift(1) > recent_price) & (recent_price.shift(-1) > recent_price)
+    low_indices = recent_price[lows].index[-2:]
+    if len(low_indices) < 2:
+        return False
+    prev_low_idx, last_low_idx = low_indices
+    if price[last_low_idx] < price[prev_low_idx] and indicator[last_low_idx] > indicator[prev_low_idx]:
+        return True
+    return False
+
+# Data Provider (gets prices from the internet)
+class PolygonDataProvider:
+    def __init__(self):
+        # YOUR KEY IS ALREADY HERE! 🎉
+        self.client = RESTClient("2lm_5uIh9NF6hQkcOxJN85RL9Ta0xHjF")
+
+    def get_ohlcv(self, symbol, timeframe, from_date, to_date):
+        if timeframe.endswith('m'):
+            multiplier = int(timeframe[:-1])
+            timespan = 'minute'
+        elif timeframe.endswith('h'):
+            multiplier = int(timeframe[:-1])
+            timespan = 'hour'
+        elif timeframe.endswith('d'):
+            multiplier = int(timeframe[:-1])
+            timespan = 'day'
+        else:
+            raise ValueError(f"Unsupported timeframe: {timeframe}")
+        
+        try:
+            aggs = self.client.get_aggs(symbol, multiplier, timespan, from_date, to_date)
+            if not aggs:
+                return pd.DataFrame()
+            df = pd.DataFrame(aggs)
+            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+            df.set_index('timestamp', inplace=True)
+            df.rename(columns={'open': 'open', 'high': 'high', 'low': 'low', 'close': 'close', 'volume': 'volume'}, inplace=True)
+            return df[['open', 'high', 'low', 'close', 'volume']]
+        except Exception as e:
+            print(f"Error fetching data for {symbol}: {e}")
+            return pd.DataFrame()
+
+# Check for good buy signals
+def check_buy_signal(df, timeframe, is_crypto=False):
+    if len(df) < 50:
+        return None
+    
+    df['rsi'] = rsi(df['close'])
+    df['macd_line'], df['macd_signal'], df['macd_hist'] = macd(df['close'])
+    df['ema10'] = ema(df['close'], 10)
+    df['ema20'] = ema(df['close'], 20)
+    df['ema50'] = ema(df['close'], 50)
+    df['atr'] = atr(df['high'], df['low'], df['close'])
+    df['adx'] = adx(df['high'], df['low'], df['close'])
+    df['vol_avg20'] = df['volume'].rolling(20).mean()
+    df['vol_std'] = df['close'].pct_change().rolling(20).std()
+    
+    last = df.iloc[-1]
+    
+    if last['adx'] < 25 or last['vol_std'] < 0.01:
+        return None
+    
+    vol_threshold = 1000000 if is_crypto else 100000
+    if last['vol_avg20'] < vol_threshold:
+        return None
+    
+    criteria = {}
+    score = 0
+    
+    rsi_reclaim = (df['rsi'].iloc[-2] < 30) and (last['rsi'] > 30)
+    rsi_divergence = is_bullish_divergence(df['low'], df['rsi'])
+    if rsi_reclaim or rsi_divergence:
+        criteria['rsi'] = True
+        score += 25
+    
+    if (last['macd_hist'] > 0) and (df['macd_hist'].iloc[-1] > df['macd_hist'].iloc[-2] > df['macd_hist'].iloc[-3]):
+        criteria['macd'] = True
+        score += 20
+    
+    if last['close'] > last['ema10'] > last['ema20'] > last['ema50']:
+        criteria['ema'] = True
+        score += 20
+    
+    recent_low = df['low'].iloc[-20:].min()
+    prev_low = df['low'].iloc[-40:-20].min() if len(df) > 40 else np.inf
+    if recent_low > prev_low:
+        criteria['structure'] = True
+        score += 20
+    
+    if last['volume'] > 1.5 * last['vol_avg20']:
+        criteria['volume'] = True
+        score += 15
+    
+    if score < 70:
+        return None
+    
+    invalidation = recent_low - last['atr']
+    
+    return {
+        'score': score,
+        'criteria': criteria,
+        'invalidation': invalidation
+    }
+
+# The main scanner robot
+class MarketScanner:
+    def __init__(self, assets, timeframes, data_provider):
+        self.assets = assets
+        self.timeframes = timeframes
+        self.data_provider = data_provider
+
+    def scan(self):
+        signals = []
+        current_date = datetime.now()
+        to_date = current_date.strftime('%Y-%m-%d')
+        from_date = (current_date - timedelta(days=200)).strftime('%Y-%m-%d')
+
+        for symbol, info in self.assets.items():
+            is_crypto = info['type'] == 'crypto'
+            mtf_signals = {}
+            for tf in self.timeframes:
+                df = self.data_provider.get_ohlcv(symbol, tf, from_date, to_date)
+                if df.empty:
+                    continue
+                signal = check_buy_signal(df, tf, is_crypto)
+                if signal:
+                    mtf_signals[tf] = signal
+            
+            if len(mtf_signals) < 2:
+                continue
+            
+            total_score = sum(s['score'] for s in mtf_signals.values())
+            criteria_all = {tf: s['criteria'] for tf, s in mtf_signals.items()}
+            invalidation = min(s['invalidation'] for s in mtf_signals.values())
+            
+            signals.append({
+                'symbol': symbol,
+                'score': total_score,
+                'criteria': criteria_all,
+                'invalidation': invalidation
+            })
+        
+        signals.sort(key=lambda x: x['score'], reverse=True)
+        return signals
+
+# Start the robot!
+if __name__ == "__main__":
+    # First install the tools it needs (run this once)
+    !pip install pandas numpy polygon-api-client -q
+    
+    provider = PolygonDataProvider()
+    
+    # Things we want to watch (you can add more later!)
+    assets = {
+        'AAPL': {'type': 'stock'},
+        'MSFT': {'type': 'stock'},
+        'TSLA': {'type': 'stock'},
+        'X:BTCUSD': {'type': 'crypto'},
+        'X:ETHUSD': {'type': 'crypto'}
+    }
+    
+    timeframes = ['1h', '4h', '1d']
+    scanner = MarketScanner(assets, timeframes, provider)
+    
+    print("🚀 Market Scanner Robot is starting! Looking for good buys...")
+    
+    # It will check every 15 minutes forever
+    while True:
+        print(f"\n🕐 Checking the markets now... {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+        opportunities = scanner.scan()
+        if opportunities:
+            print("🎯 Found strong buy signals!")
+            for opp in opportunities:
+                print(f"\n💰 {opp['symbol']} - Score: {opp['score']}")
+                print("Why it looks good:")
+                for tf, crit in opp['criteria'].items():
+                    triggered = ', '.join(k for k, v in crit.items() if v)
+                    print(f"   • {tf}: {triggered}")
+                print(f"   ⚠️  Watch out below: {opp['invalidation']:.2f}")
+        else:
+            print("😴 Nothing super strong right now. Checking again soon...")
+        
+        sleep(900)  # Wait 15 minutes
